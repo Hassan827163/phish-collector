@@ -94,14 +94,21 @@ def use_budget():
 
 
 def vt_call(method, path, **kw):
+    """Response lautata hai, ya None agar 4 koshishon ke baad bhi network fail ho."""
     global _last_call
+    r = None
     for attempt in range(4):
         wait = MIN_GAP_SECONDS - (time.time() - _last_call)
         if wait > 0:
             time.sleep(wait)
         use_budget()
         _last_call = time.time()
-        r = session.request(method, VT_BASE + path, timeout=30, **kw)
+        try:
+            r = session.request(method, VT_BASE + path, timeout=30, **kw)
+        except requests.RequestException:  # timeout / connection error: crash nahi, dobara koshish
+            r = None
+            time.sleep(30 * (attempt + 1))
+            continue
         if r.status_code == 429:           # quota/rate limit
             time.sleep(60 * (attempt + 1))
             continue
@@ -113,6 +120,8 @@ def vt_call(method, path, **kw):
 def lookup(url):
     t = iso(now())
     r = vt_call("GET", f"/urls/{vt_url_id(url)}")
+    if r is None:
+        return {"checked_at": t, "state": "error", "http_status": None}
     if r.status_code == 404:
         return {"checked_at": t, "state": "unknown"}
     if r.status_code != 200:
@@ -136,8 +145,8 @@ def lookup(url):
 def scan(url):
     t = iso(now())
     r = vt_call("POST", "/urls", data={"url": url})
-    out = {"scanned_at": t, "http_status": r.status_code}
-    if r.status_code == 200:
+    out = {"scanned_at": t, "http_status": r.status_code if r is not None else None}
+    if r is not None and r.status_code == 200:
         out["analysis_id"] = r.json().get("data", {}).get("id")
     return out
 
@@ -218,7 +227,16 @@ def write_report(state):
         t0 = next((x for x in o if x["kind"] == "t0_lookup"), {})
         polls = [x for x in o if x["kind"] == "poll"]
         found_polls = [x for x in polls if x.get("state") == "found"]
-        dates = {x.get("last_analysis_date") for x in found_polls}
+
+        def sig(x):  # report ki "pehchaan": unknown/found + last_analysis_date
+            return (x.get("state"), x.get("last_analysis_date"))
+
+        ok_polls = [x for x in polls if x.get("state") in ("found", "unknown")]
+        # (a) t0 lookup -> pehli poll: S mein ye hamare scan ka asar hai, L mein organic badlaav
+        changed_first = bool(t0) and bool(ok_polls) and t0.get("state") in ("found", "unknown") \
+            and sig(t0) != sig(ok_polls[0])
+        # (b) polls ke dauran badlaav (unknown -> found bhi gina jata hai)
+        changed_polls = len({sig(x) for x in ok_polls}) > 1
         first_mal = next((x["hours_since_t0"] for x in found_polls
                           if x["stats"].get("malicious", 0) >= 1), None)
         first_mal5 = next((x["hours_since_t0"] for x in found_polls
@@ -227,14 +245,15 @@ def write_report(state):
         t0_state = t0.get("state", "-")
         if t0_state == "found":
             t0_state += f" ({t0['stats'].get('malicious', 0)} mal)"
-        updated = len(dates) > 1
+        yn = lambda b: "haan" if b else "nahi"
         rows.append(f"| {i} | {rec['group']} | {t0_state} | {len(polls)} | "
-                    f"{'haan' if updated else 'nahi'} | "
+                    f"{yn(changed_first)} | {yn(changed_polls)} | "
                     f"{first_mal if first_mal is not None else '-'} | "
                     f"{first_mal5 if first_mal5 is not None else '-'} | {max_mal} |")
         summary[rec["group"]].append({
             "t0_unknown": t0.get("state") == "unknown",
-            "updated": updated,
+            "changed_first": changed_first,
+            "changed_polls": changed_polls,
             "first_mal": first_mal,
             "first_mal5": first_mal5,
         })
@@ -247,26 +266,30 @@ def write_report(state):
         "# Pilot report", "",
         f"Shuru: {state.get('started_at')}  |  Har group: {N_PER_GROUP} URLs  |  Muddat: {PILOT_HOURS}h", "",
         "## Khulasa", "",
-        "| Group | t0 par VT mein nahi (unknown) | Report bina hamare scan ke badli | 1+ engine (median) | 5+ engines (median) | 24h tak 5+ engines |",
-        "|---|---|---|---|---|---|",
+        "| Group | t0 par VT mein nahi (unknown) | t0 -> pehli poll report badli | Polls ke dauran report badli | 1+ engine (median) | 5+ engines (median) | 24h tak 5+ engines |",
+        "|---|---|---|---|---|---|---|",
     ]
     for g in ("S", "L"):
         s = summary[g]
-        n = len(s) or 1
         lines.append(
             f"| {g} | {sum(x['t0_unknown'] for x in s)}/{len(s)} | "
-            f"{sum(x['updated'] for x in s)}/{len(s)} | "
+            f"{sum(x['changed_first'] for x in s)}/{len(s)} | "
+            f"{sum(x['changed_polls'] for x in s)}/{len(s)} | "
             f"{med([x['first_mal'] for x in s])} | {med([x['first_mal5'] for x in s])} | "
             f"{sum(x['first_mal5'] is not None for x in s)}/{len(s)} |")
     lines += [
-        "", "**Kaise parhein:** Group L mein agar \"report badli\" zyada tar *nahi* hai, to "
-        "lookup-only system ko VT ki purani/khaali report hi milti hai -> L/S design zaroori hai. "
-        "Agar L ki report bhi khud badalti rahi, to ek hi group kaafi ho sakta hai.", "",
+        "", "**Kaise parhein:**",
+        "- **L group:** agar dono \"badli\" columns zyada tar *nahi* hain, to lookup-only system ko "
+        "VT ki purani/khaali report hi milti hai -> L/S design zaroori hai. Agar L ki report bhi khud "
+        "badalti rahi (unknown -> found bhi), to ek hi group kaafi ho sakta hai.",
+        "- **S group:** \"t0 -> pehli poll\" mein hamare apne scan ka result aana chahiye (ye sirf check hai). "
+        "Asal sawaal \"polls ke dauran badli\" hai: Peng et al. (2019) ke mutabiq vendors ki baad wali "
+        "detections tab tak lookup mein nahi aatin jab tak koi naya scan na ho.", "",
         "## Har URL", "",
-        "| # | Group | t0 halat | Polls | Report badli? | 1+ engine (h) | 5+ engines (h) | Max malicious |",
-        "|---|---|---|---|---|---|---|---|",
+        "| # | Group | t0 halat | Polls | t0 -> pehli poll badli? | Polls ke dauran badli? | 1+ engine (h) | 5+ engines (h) | Max malicious |",
+        "|---|---|---|---|---|---|---|---|---|",
         *rows, "",
-        "_Note: S group mein t0 wala scan hamara apna hai; \"report badli\" sirf baad ke polls ko dekhta hai._",
+        "_Note: unknown -> found bhi \"badli\" gina jata hai. S group ka t0 lookup hamare scan se pehle ka hai._",
     ]
     REPORT_FILE.write_text("\n".join(lines))
 

@@ -47,10 +47,13 @@ OPENPHISH_FEED = "https://openphish.com/feed.txt"
 URLSCAN_SEARCH = "https://urlscan.io/api/v1/search/"
 URLHAUS_RECENT = "https://urlhaus-api.abuse.ch/v1/urls/recent/limit/200/"
 # urlscan ke liye kuch queries; pehli jo results de, wahi use hoti hai (state mein note hoti hai)
+# free plan: verdicts.* search nahi hota, is liye submit karne walon ke tags use karte hain
 URLSCAN_QUERIES = [
-    "verdicts.malicious:true AND date:>now-2h",
-    "verdicts.overall.malicious:true AND date:>now-2h",
+    "task.tags:phishing AND date:>now-3h",
+    "(task.tags:phish OR task.tags:scam OR task.tags:malicious) AND date:>now-3h",
 ]
+PHISHUNT_API = "https://phishunt.io/api/v1/domains"
+PHISHUNT_RAW = "https://raw.githubusercontent.com/0xDanielLopez/phishunt-feed/main/feed.json"
 
 STATE_FILE = DATA_DIR / "state.json"
 OBS_FILE = DATA_DIR / "observations.jsonl"
@@ -222,7 +225,70 @@ def src_urlhaus(state):
     return out
 
 
-SOURCES = {"openphish": src_openphish, "urlscan": src_urlscan, "urlhaus": src_urlhaus}
+def _ph_records(js):
+    """phishunt ka JSON list ho ya {results/data/domains: [...]}, dono sambhalo."""
+    if isinstance(js, list):
+        return js
+    if isinstance(js, dict):
+        for k in ("results", "data", "domains", "items"):
+            if isinstance(js.get(k), list):
+                return js[k]
+    return []
+
+
+def _to_iso(v):
+    if not v:
+        return None
+    if isinstance(v, (int, float)):
+        return iso(datetime.fromtimestamp(v, timezone.utc))
+    s = str(v).replace("T", " ")[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return iso(datetime.strptime(s[:len(fmt) + 2 if "%H" in fmt else 10], fmt).replace(tzinfo=timezone.utc))
+        except ValueError:
+            continue
+    return None
+
+
+def src_phishunt(state):
+    """Certificate Transparency se mile naye suspicious phishing domains (free, bina key)."""
+    js = None
+    for url in (PHISHUNT_API, PHISHUNT_RAW):
+        try:
+            r = requests.get(url, params={"limit": 500} if url == PHISHUNT_API else None, timeout=60)
+            if r.status_code == 200:
+                js = r.json()
+                state["phishunt_endpoint"] = url
+                break
+            state.setdefault("errors", []).append({"at": iso(now()), "src": "phishunt", "url": url,
+                                                   "http_status": r.status_code})
+        except (requests.RequestException, ValueError) as e:
+            state.setdefault("errors", []).append({"at": iso(now()), "src": "phishunt", "url": url,
+                                                   "err": str(e)[:200]})
+    if js is None:
+        return []
+    out = []
+    for x in _ph_records(js):
+        if isinstance(x, str):
+            x = {"url": x}
+        if not isinstance(x, dict):
+            continue
+        u = x.get("url") or x.get("domain") or x.get("hostname")
+        if not u:
+            continue
+        if not str(u).startswith("http"):
+            u = "https://" + str(u).strip("/") + "/"
+        st = _to_iso(x.get("first_seen")) or _to_iso(x.get("date")) or iso(now())
+        meta = {k: x.get(k) for k in ("company", "score", "verdict", "malicious_openphish",
+                                     "malicious_urlscan", "malicious_google") if k in x}
+        out.append({"url": u, "source_time": st, "meta": meta})
+    if not state.get("phishunt_sample"):
+        state["phishunt_sample"] = _ph_records(js)[:2]   # pehli dafa format dekhne ke liye
+    return out
+
+
+SOURCES = {"openphish": src_openphish, "urlscan": src_urlscan, "urlhaus": src_urlhaus,
+           "phishunt": src_phishunt}
 
 
 # ---------------- phases ----------------

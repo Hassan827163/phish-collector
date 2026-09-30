@@ -327,7 +327,15 @@ def pick_new(state):
                           key=lambda x: x["source_time"], reverse=True)[:300]
         if not queue or not can_pick(state, src) or time_left() < 60:
             continue
-        c = queue.pop(0)                                   # sabse taaza
+        if src == "phishunt":
+            # phishunt: "noise" verdict wale kabhi nahi; baqi mein zyada score, phir taaza
+            good = [i for i in range(len(queue)) if queue[i]["meta"].get("verdict") != "noise"]
+            if not good:
+                continue
+            idx = max(good, key=lambda i: (queue[i]["meta"].get("score") or 0, queue[i]["source_time"]))
+            c = queue.pop(idx)
+        else:
+            c = queue.pop(0)                               # sabse taaza
         res = vt_lookup(c["url"])
         rec = {"url": c["url"], "source": src, "source_time": c["source_time"],
                "t0": res["checked_at"], "meta": c["meta"], "rechecked": False}

@@ -1,0 +1,49 @@
+name: label-urlscan
+
+on:
+  workflow_dispatch:          # sirf haath se, ek dafa chalana hai
+
+concurrency:
+  group: pilot2               # pilot2 ke saath ek waqt mein na chale
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Code checkout (phish-collector)
+        uses: actions/checkout@v4
+
+      - name: Data checkout (private phish-data)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/phish-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Label urlscan URLs
+        env:
+          URLSCAN_API_KEY: ${{ secrets.URLSCAN_API_KEY }}
+          DATA_DIR: data
+        run: python label_urlscan.py
+
+      - name: Save data to phish-data
+        if: always()
+        working-directory: data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "urlscan labels $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase --quiet || true
+          git push

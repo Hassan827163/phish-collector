@@ -5,18 +5,20 @@ Main collector: "Evaluated Too Late" study (8 hafte).
 Har run (~15 min, cron-job.org -> workflow_dispatch):
   1. Jo snapshots due hain, un ka VirusTotal LOOKUP (kabhi scan nahi) + liveness.
   2. Naye URLs chunna, teen groups mein:
-       phishunt  (gap group)     : CT-log se naye domains, first_seen < 60 min, verdict != noise
+       phishunt  (gap group)     : CT-log se naye domains, first_seen < 120 min (v1: 60), verdict != noise
        openphish (control group) : OpenPhish free feed (feed-time t0)
        benign    (candidates)    : B1 = Tranco top-1M ke naye entries, B2 = phishunt "noise" (taaza)
   3. t0 par DNS / ASN / RDAP (domain age) / grouping keys save; ye baad mein nahi badalte.
   4. OpenPhish feed mein hamare active hosts dikhen to "feed_seen" record (label mein sirf madad).
 
 Snapshots (ghante, t0 se):
-  phishunt, openphish : URL @ 0,1,4,24,72   +  domain @ 0,72      = 7 VT calls
+  phishunt, openphish : URL @ 0,1,2,4,24,72,168 + domain @ 0,72,168 = 10 VT calls
   benign              : URL @ 0,72          +  domain @ 0,72      = 4 VT calls
 
 VT free: 4 calls/min, 500/din (UTC). Yahan 16 sec gap aur 485/din hard cap.
-Roz ke caps: phishunt 48, openphish 12, benign 10 (B1 5 + B2 5) ~= 460 calls/din.
+Roz ke caps: phishunt 30, openphish 10, benign 15 (B1 10 + B2 5) <= 460 calls/din.
+(Asal mein phishunt ~20/din milte hain; v2 (8 Oct 2026): 2h + 7d snapshots, zyada benign,
+ phishunt window 60 -> 120 min (sab se taaza pehle), har URL par collector_version, supply diagnostics.)
 
 Output (DATA_DIR/main/):
   urls.jsonl    : har chune gaye URL ka ek record (static, t0 par)
@@ -66,21 +68,34 @@ DAILY_VT_CAP = 485            # VT free: 500/din (UTC); thoda margin
 MAX_RUN_SECONDS = 12 * 60 + 30
 HTTP_TIMEOUT = 10
 
-DAILY_CAP = {"phishunt": 48, "openphish": 12, "benign_tranco": 5, "benign_phishunt": 5}
+DAILY_CAP = {"phishunt": 30, "openphish": 10, "benign_tranco": 10, "benign_phishunt": 5}
 BURST = {"phishunt": 4, "openphish": 2, "benign_tranco": 1, "benign_phishunt": 1}  # pacing ke upar chhoot
 MAX_PICKS_PER_RUN = {"phishunt": 6, "openphish": 2, "benign_tranco": 1, "benign_phishunt": 1}
 
-PHISHUNT_MAX_AGE_MIN = 60     # gap group: first_seen se zyada se zyada itne minute purana
+COLLECTOR_VERSION = 2
+PHISHUNT_MAX_AGE_MIN = 120    # gap group: first_seen se itne minute tak (v1: 60). pick_delay_min se analysis mein alag ho sakta hai
 BENIGN_PH_MAX_AGE_MIN = 360   # B2 (noise) ke liye thodi dheel
 OPENPHISH_QUEUE_HOURS = 12
 
 SCHEDULES = {
     # snapshot naam -> (ghante, [VT calls])
-    "full": {"t0": (0, ["url", "domain"]), "1h": (1, ["url"]), "4h": (4, ["url"]),
-             "24h": (24, ["url"]), "72h": (72, ["url", "domain"])},
+    "full": {"t0": (0, ["url", "domain"]), "1h": (1, ["url"]), "2h": (2, ["url"]), "4h": (4, ["url"]),
+             "24h": (24, ["url"]), "72h": (72, ["url", "domain"]), "7d": (168, ["url", "domain"])},
     "light": {"t0": (0, ["url", "domain"]), "72h": (72, ["url", "domain"])},
 }
 GROUP_SCHEDULE = {"phishunt": "full", "openphish": "full", "benign": "light"}
+# v1 (6-7 Oct) ke URLs ka 2h snapshot nahi tha; unhein ab late 2h nahi dena. 7d unhein bhi milega.
+V1_FULL_PLAN = ["t0", "1h", "4h", "24h", "72h", "7d"]
+
+
+def plan_of(rec):
+    """Is URL ke liye kaun se snapshots hain (purane records ke liye v1 plan)."""
+    sched = SCHEDULES[GROUP_SCHEDULE[rec["group"]]]
+    if "plan" in rec:
+        return [n for n in rec["plan"] if n in sched]
+    if GROUP_SCHEDULE[rec["group"]] == "full":
+        return V1_FULL_PLAN
+    return list(sched)
 
 VT_BASE = "https://www.virustotal.com/api/v3"
 OPENPHISH_FEED = "https://openphish.com/feed.txt"
@@ -453,7 +468,7 @@ def calls_due_today_pending(state):
     n = 0
     for rec in state.get("active", {}).values():
         for name, (h, kinds) in SCHEDULES[GROUP_SCHEDULE[rec["group"]]].items():
-            if name in rec["done"]:
+            if name in rec["done"] or name not in plan_of(rec):
                 continue
             if parse_iso(rec["t0"]) + timedelta(hours=h) <= end:
                 n += len(kinds)
@@ -476,12 +491,14 @@ def register(state, cand, source, group):
         "source_time": cand["source_time"], "picked_at": t_pick,
         "pick_delay_min": round((now() - parse_iso(cand["source_time"])).total_seconds() / 60, 1),
         "audit_rank": round(audit_rank(url), 8), "meta": cand.get("meta", {}), **keys,
+        "collector_version": COLLECTOR_VERSION, "plan": list(SCHEDULES[GROUP_SCHEDULE[group]]),
     }
     rec["dns_t0"] = dns_info(host)
     rec["rdap_t0"] = rdap_info(keys["registered_domain"]) if not keys["shared_platform"] else {"ok": False, "skipped": "shared_platform"}
     rec["vt_domain_queried"] = keys["etld1"]
     state.setdefault("active", {})[rec["id"]] = {
-        "url": url, "group": group, "t0": t_pick, "domain": keys["etld1"], "done": []}
+        "url": url, "group": group, "t0": t_pick, "domain": keys["etld1"], "done": [],
+        "plan": list(SCHEDULES[GROUP_SCHEDULE[group]])}
     state.setdefault("seen", {})[rec["id"]] = t_pick
     append_jsonl(URLS_FILE, rec)
     d = today_key()
@@ -491,12 +508,18 @@ def register(state, cand, source, group):
     run_snapshot(state, rec["id"], "t0")
 
 
-def pick_phishunt(state, records):
+def pick_phishunt(state, records, summary=None):
     fresh, noise = [], []
+    diag = {"lt60": 0, "60_120": 0, "older": 0, "noise": 0, "already_seen": 0}
     for c in records:
         if uid(c["url"]) in state.get("seen", {}):
+            diag["already_seen"] += 1
             continue
         age = (now() - parse_iso(c["source_time"])).total_seconds() / 60
+        if c["meta"].get("verdict") == "noise":
+            diag["noise"] += 1
+        else:
+            diag["lt60" if age < 60 else "60_120" if age <= 120 else "older"] += 1
         if c["meta"].get("verdict") == "noise":
             # B2 = benign *candidates*. TI flags ya brand se filter NAHI karte: warna benign group
             # TI ke false positives se khaali ho jata (circular), aur phishunt har record par brand
@@ -507,6 +530,8 @@ def pick_phishunt(state, records):
         elif 0 <= age <= PHISHUNT_MAX_AGE_MIN:
             fresh.append(c)
     fresh.sort(key=lambda c: c["source_time"], reverse=True)          # sab se taaza pehle
+    if summary is not None:
+        summary["phishunt_supply"] = diag      # naye (pehle na chune) records ki ginti, umar ke hisaab se
     n = 0
     for c in fresh:
         if n >= MAX_PICKS_PER_RUN["phishunt"] or not can_pick(state, "phishunt") \
@@ -571,7 +596,7 @@ def due_snapshots(state, max_hours=None, min_hours=None):
     out = []
     for rid, rec in state.get("active", {}).items():
         for name, (h, _) in SCHEDULES[GROUP_SCHEDULE[rec["group"]]].items():
-            if name in rec["done"]:          # t0 bhi (agar budget ki wajah se adhoora reh gaya)
+            if name in rec["done"] or name not in plan_of(rec):          # t0 bhi (agar budget ki wajah se adhoora reh gaya)
                 continue
             if max_hours is not None and h > max_hours:
                 continue
@@ -593,7 +618,7 @@ def process_due(state, **kw):
 def retire_finished(state):
     for rid in list(state.get("active", {})):
         rec = state["active"][rid]
-        if set(SCHEDULES[GROUP_SCHEDULE[rec["group"]]]) <= set(rec["done"]):
+        if set(plan_of(rec)) <= set(rec["done"]):
             del state["active"][rid]
 
 
@@ -613,16 +638,16 @@ def write_report(state):
              f"Shuru: {state.get('started_at')} | Aakhri run: {iso(now())} | Active URLs: {len(state.get('active', {}))} | "
              f"Aaj VT calls: {vt_calls_today(state)}/{DAILY_VT_CAP}", "",
              "## URL lookup: VT ne kitne URLs pakde (malicious >= 1), har snapshot par", "",
-             "| Source | URLs | t0 unknown | t0 | 1h | 4h | 24h | 72h | pick delay median (min) |",
-             "|---|---|---|---|---|---|---|---|---|"]
+             "| Source | URLs | t0 unknown | t0 | 1h | 2h | 4h | 24h | 72h | 7d | pick delay median (min) |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for src in ("phishunt", "openphish", "benign_tranco", "benign_phishunt"):
         rs = [u for u in urls if u["source"] == src]
         if not rs:
-            lines.append(f"| {src} | 0 | | | | | | | |")
+            lines.append(f"| {src} | 0 | | | | | | | | | |")
             continue
         cells = []
         unk = sum(1 for u in rs if (vt.get((u["id"], "vt_url", "t0")) or {}).get("state") == "unknown")
-        for snap in ("t0", "1h", "4h", "24h", "72h"):
+        for snap in ("t0", "1h", "2h", "4h", "24h", "72h", "7d"):
             have = [vt.get((u["id"], "vt_url", snap)) for u in rs]
             have = [o for o in have if o and o.get("state") in ("found", "unknown")]
             if not have:
@@ -632,16 +657,16 @@ def write_report(state):
             cells.append(f"{det}/{len(have)}")
         delay = statistics.median([u["pick_delay_min"] for u in rs])
         lines.append(f"| {src} | {len(rs)} | {unk}/{len(rs)} | " + " | ".join(cells) + f" | {delay:.0f} |")
-    lines += ["", "## Domain report: malicious >= 1 (t0 / 72h)", "",
-              "| Source | t0 | 72h |", "|---|---|---|"]
+    lines += ["", "## Domain report: malicious >= 1 (t0 / 72h / 7d)", "",
+              "| Source | t0 | 72h | 7d |", "|---|---|---|---|"]
     for src in ("phishunt", "openphish", "benign_tranco", "benign_phishunt"):
         rs = [u for u in urls if u["source"] == src]
         c = []
-        for snap in ("t0", "72h"):
+        for snap in ("t0", "72h", "7d"):
             have = [vt.get((u["id"], "vt_domain", snap)) for u in rs]
             have = [o for o in have if o and o.get("state") in ("found", "unknown")]
             c.append(f"{sum(1 for o in have if (mal(o) or 0) >= 1)}/{len(have)}" if have else "-")
-        lines.append(f"| {src} | {c[0]} | {c[1]} |")
+        lines.append(f"| {src} | {c[0]} | {c[1]} | {c[2]} |")
     fs = sum(1 for o in obs if o["kind"] == "feed_seen")
     groups = len({u["etld1"] for u in urls})
     patterns = len({u["pattern_key"] for u in urls})
@@ -670,7 +695,7 @@ def main():
             try:
                 ph = fetch_phishunt(state)
                 summary["phishunt_records"] = len(ph)
-                pick_phishunt(state, ph)
+                pick_phishunt(state, ph, summary)
             except BudgetExhausted:
                 raise
             except Exception as e:

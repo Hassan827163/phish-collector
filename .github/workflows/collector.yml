@@ -36,6 +36,7 @@ jobs:
       - name: Run collector
         env:
           VT_API_KEY: ${{ secrets.VT_API_KEY }}
+          URLSCAN_API_KEY: ${{ secrets.URLSCAN_API_KEY }}
           DATA_DIR: data
         run: python collector.py
 

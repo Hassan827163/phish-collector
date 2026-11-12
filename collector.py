@@ -72,7 +72,7 @@ DAILY_CAP = {"phishunt": 30, "openphish": 10, "benign_tranco": 10, "benign_phish
 BURST = {"phishunt": 4, "openphish": 2, "benign_tranco": 1, "benign_phishunt": 1}  # pacing ke upar chhoot
 MAX_PICKS_PER_RUN = {"phishunt": 6, "openphish": 2, "benign_tranco": 1, "benign_phishunt": 1}
 
-COLLECTOR_VERSION = 2
+COLLECTOR_VERSION = 3          # v3 (12 Nov 2026): t0 par urlscan Private scan = label ka saboot
 PHISHUNT_MAX_AGE_MIN = 120    # gap group: first_seen se itne minute tak (v1: 60). pick_delay_min se analysis mein alag ho sakta hai
 BENIGN_PH_MAX_AGE_MIN = 360   # B2 (noise) ke liye thodi dheel
 OPENPHISH_QUEUE_HOURS = 12
@@ -109,6 +109,16 @@ OBS_FILE = DATA_DIR / "obs.jsonl"
 STATE_FILE = DATA_DIR / "state.json"
 LOG_FILE = DATA_DIR / "run_log.jsonl"
 REPORT_FILE = DATA_DIR / "report.md"
+EVIDENCE_DIR = DATA_DIR / "evidence"
+
+# ---- t0 saboot (evidence): urlscan Private scan, VT ko nahi chhoota ----
+URLSCAN_KEY = os.environ.get("URLSCAN_API_KEY", "")
+URLSCAN_SCAN = "https://urlscan.io/api/v1/scan/"
+URLSCAN_RESULT = "https://urlscan.io/api/v1/result/{}/"
+URLSCAN_SHOT = "https://urlscan.io/screenshots/{}.png"
+EVIDENCE_AUDIT_RANK = 0.20     # audit_rank < 0.20 = random audit sample (har group se ~20%)
+EVIDENCE_DAILY_CAP = 30        # roz zyada se zyada itne private scans
+EVIDENCE_GIVE_UP_MIN = 120     # itni der tak result na mile to chhod do
 
 vt = requests.Session()
 vt.headers.update({"x-apikey": VT_KEY, "User-Agent": UA})
@@ -506,6 +516,99 @@ def register(state, cand, source, group):
     state["counts"] = state.get("counts", {})
     state["counts"][source] = state["counts"].get(source, 0) + 1
     run_snapshot(state, rec["id"], "t0")
+    maybe_evidence(state, rec["id"], url, group, rec["audit_rank"])
+
+
+# ======================= t0 evidence (urlscan Private scan) =======================
+def evidence_reason(state, rid, group, rank):
+    if rank < EVIDENCE_AUDIT_RANK:
+        return "audit_sample"
+    if group == "phishunt" and state["active"][rid].get("t0_state") == "unknown":
+        return "phishunt_t0_unknown"
+    return None
+
+
+def maybe_evidence(state, rid, url, group, rank):
+    """Audit sample + VT-unknown phishunt URLs ka t0 par urlscan PRIVATE scan. Fail ho to collection na ruke."""
+    if not URLSCAN_KEY:
+        return
+    reason = evidence_reason(state, rid, group, rank)
+    if not reason:
+        return
+    cnt = state.setdefault("evidence_count", {})
+    d = today_key()
+    if cnt.get(d, 0) >= EVIDENCE_DAILY_CAP:
+        append_jsonl(OBS_FILE, {"id": rid, "kind": "evidence_skip", "reason": reason, "why": "daily_cap", "at": iso(now())})
+        return
+    for k in list(cnt):
+        if k < iso(now() - timedelta(days=10))[:10]:
+            del cnt[k]
+    try:
+        r = web.post(URLSCAN_SCAN, headers={"API-Key": URLSCAN_KEY, "Content-Type": "application/json"},
+                     json={"url": url, "visibility": "private"}, timeout=20)
+    except requests.RequestException as e:
+        append_jsonl(OBS_FILE, {"id": rid, "kind": "evidence_skip", "reason": reason, "why": type(e).__name__, "at": iso(now())})
+        return
+    cnt[d] = cnt.get(d, 0) + 1
+    if r.status_code != 200:
+        try:
+            msg = (r.json().get("message") or r.json().get("description") or "")[:200]
+        except Exception:
+            msg = r.text[:200]
+        append_jsonl(OBS_FILE, {"id": rid, "kind": "evidence_skip", "reason": reason,
+                                "why": f"http_{r.status_code}", "msg": msg, "at": iso(now())})
+        if r.status_code == 429:
+            log_error(state, "urlscan", "429 quota")
+        return
+    uuid = r.json().get("uuid")
+    append_jsonl(OBS_FILE, {"id": rid, "kind": "evidence_submit", "reason": reason, "uuid": uuid,
+                            "visibility": "private", "at": iso(now())})
+    state.setdefault("evidence_pending", []).append({"id": rid, "uuid": uuid, "at": iso(now())})
+
+
+def process_evidence(state):
+    """Pending scans ka result: page ka khulasa (obs) + screenshot (evidence/<id>_t0.png)."""
+    if not URLSCAN_KEY:
+        return
+    keep = []
+    for p in state.get("evidence_pending", []):
+        age_min = (now() - parse_iso(p["at"])).total_seconds() / 60
+        if age_min < 1 or time_left() < 60:
+            keep.append(p)
+            continue
+        try:
+            r = web.get(URLSCAN_RESULT.format(p["uuid"]), headers={"API-Key": URLSCAN_KEY}, timeout=30)
+        except requests.RequestException:
+            keep.append(p)
+            continue
+        if r.status_code == 404 and age_min < EVIDENCE_GIVE_UP_MIN:
+            keep.append(p)                      # abhi scan ho raha hai
+            continue
+        if r.status_code != 200:
+            append_jsonl(OBS_FILE, {"id": p["id"], "kind": "evidence_result", "uuid": p["uuid"], "ok": False,
+                                    "http_status": r.status_code, "at": iso(now())})
+            continue
+        js = r.json()
+        page = js.get("page") or {}
+        task = js.get("task") or {}
+        v = (js.get("verdicts") or {}).get("overall") or {}
+        shot = None
+        try:
+            s = web.get(URLSCAN_SHOT.format(p["uuid"]), headers={"API-Key": URLSCAN_KEY}, timeout=30)
+            if s.status_code == 200 and s.content[:4] == b"\x89PNG":
+                EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+                shot = f"evidence/{p['id']}_t0.png"
+                (DATA_DIR / shot).write_bytes(s.content)
+        except requests.RequestException:
+            pass
+        append_jsonl(OBS_FILE, {
+            "id": p["id"], "kind": "evidence_result", "uuid": p["uuid"], "ok": True, "at": iso(now()),
+            "scan_time": task.get("time"), "final_url": (page.get("url") or "")[:300],
+            "title": (page.get("title") or "")[:200], "page_status": page.get("status"),
+            "server_ip": page.get("ip"), "country": page.get("country"),
+            "urlscan_verdict": {"malicious": v.get("malicious"), "score": v.get("score"), "brands": v.get("brands")},
+            "screenshot": shot})
+    state["evidence_pending"] = keep
 
 
 def pick_phishunt(state, records, summary=None):
@@ -584,6 +687,8 @@ def run_snapshot(state, rid, name):
     due = parse_iso(rec["t0"]) + timedelta(hours=h)
     for kind in kinds:
         res = vt_url(state, rec["url"]) if kind == "url" else vt_domain(state, rec["domain"])
+        if name == "t0" and kind == "url":
+            rec["t0_state"] = res.get("state")
         append_jsonl(OBS_FILE, {"id": rid, "kind": "vt_" + kind, "snapshot": name, "due": iso(due),
                                 "checked_at": iso(now()), "hours_since_t0": round(
                                     (now() - parse_iso(rec["t0"])).total_seconds() / 3600, 3), **res})
@@ -673,7 +778,10 @@ def write_report(state):
     lines += ["", f"Feed mein baad mein dikhe (phishunt/benign hosts, OpenPhish): {fs}",
               f"Distinct eTLD+1: {groups} | distinct pattern_key: {patterns} | total URLs: {len(urls)}",
               f"Tranco naye entries (aakhri din): {state.get('tranco_new_count', '-')}",
-              f"Errors (aakhri 100 mein): {len(state.get('errors', []))}", "",
+              f"Errors (aakhri 100 mein): {len(state.get('errors', []))}",
+              f"t0 evidence (urlscan private): submit {sum(1 for o in obs if o['kind'] == 'evidence_submit')}, "
+              f"screenshot {sum(1 for o in obs if o['kind'] == 'evidence_result' and o.get('screenshot'))}, "
+              f"skip {sum(1 for o in obs if o['kind'] == 'evidence_skip')}, pending {len(state.get('evidence_pending', []))}", "",
               "_Note: 'unknown' = VT ke paas URL ka record hi nahi. Labels VT se nahi, manual sample (audit_rank) se banenge._"]
     REPORT_FILE.write_text("\n".join(lines))
 
@@ -720,6 +828,10 @@ def main():
         summary["budget"] = str(e)
         print(e)
     finally:
+        try:
+            process_evidence(state)            # VT budget se azad
+        except Exception as e:
+            log_error(state, "evidence", e)
         retire_finished(state)
         if not picking and not state.get("active"):
             state["phase"] = "done"
